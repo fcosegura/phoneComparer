@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "phone-comparer",
+  "name": "phonecomparer",
   "main": "./src/worker.js",
   "compatibility_date": "2026-05-12",
   "compatibility_flags": ["nodejs_compat"],
