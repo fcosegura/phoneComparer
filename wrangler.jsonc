@@ -18,7 +18,7 @@
     {
       "binding": "DB",
       "database_name": "phone-comparer-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_id": "e587bf34-d178-44d9-aa9a-2921ca678b7c"
     }
   ],
   "ai": {
