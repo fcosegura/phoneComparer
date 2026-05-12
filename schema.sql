@@ -29,3 +29,21 @@ CREATE TABLE IF NOT EXISTS comparison_history (
 
 CREATE INDEX IF NOT EXISTS idx_comparison_history_scope_key
   ON comparison_history(scope_id, comparison_key);
+
+CREATE TABLE IF NOT EXISTS comparison_jobs (
+  id TEXT PRIMARY KEY,
+  scope_id TEXT NOT NULL DEFAULT 'public',
+  status TEXT NOT NULL,
+  progress REAL NOT NULL DEFAULT 0,
+  stage TEXT NOT NULL,
+  stage_label TEXT NOT NULL,
+  device_count INTEGER NOT NULL DEFAULT 0,
+  completed_count INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_comparison_jobs_scope_created
+  ON comparison_jobs(scope_id, created_at DESC);

@@ -71,7 +71,16 @@ Chequeo rapido del Worker.
 
 ### `POST /api/compare`
 
-Body esperado:
+Mantiene el flujo sincronico original y devuelve la comparacion completa en una sola respuesta.
+
+### `POST /api/compare/start`
+
+Inicia una comparacion asincrona y devuelve un `job` con progreso.
+
+### `GET /api/compare/status?id=<jobId>`
+
+Consulta el estado del job asincrono. Cuando termina, incluye el `result` completo.
+Body esperado para `POST /api/compare` y `POST /api/compare/start`:
 
 ```json
 {
