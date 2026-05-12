@@ -535,32 +535,34 @@ async function resolveDevice(name, env, forceRefresh, onProgress = async () => {
       ...freshDevice,
       cached: false,
     },
-    writeStatement: env.DB
-      .prepare(
-        `INSERT INTO device_cache (
-          id, scope_id, normalized_name, display_name, search_query, spec_json, source_json,
-          fetched_at, last_used_at, hit_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-        ON CONFLICT(scope_id, normalized_name) DO UPDATE SET
-          display_name = excluded.display_name,
-          search_query = excluded.search_query,
-          spec_json = excluded.spec_json,
-          source_json = excluded.source_json,
-          fetched_at = excluded.fetched_at,
-          last_used_at = excluded.last_used_at,
-          hit_count = device_cache.hit_count + 1`,
-      )
-      .bind(
-        freshDevice.id,
-        SCOPE_ID,
-        normalizedName,
-        freshDevice.name,
-        freshDevice.searchQuery,
-        JSON.stringify(stripVolatileFields(freshDevice)),
-        JSON.stringify(freshDevice.sources),
-        freshDevice.fetchedAt,
-        freshDevice.fetchedAt,
-      ),
+    writeStatement: shouldCacheDevice(freshDevice)
+      ? env.DB
+          .prepare(
+            `INSERT INTO device_cache (
+              id, scope_id, normalized_name, display_name, search_query, spec_json, source_json,
+              fetched_at, last_used_at, hit_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(scope_id, normalized_name) DO UPDATE SET
+              display_name = excluded.display_name,
+              search_query = excluded.search_query,
+              spec_json = excluded.spec_json,
+              source_json = excluded.source_json,
+              fetched_at = excluded.fetched_at,
+              last_used_at = excluded.last_used_at,
+              hit_count = device_cache.hit_count + 1`,
+          )
+          .bind(
+            freshDevice.id,
+            SCOPE_ID,
+            normalizedName,
+            freshDevice.name,
+            freshDevice.searchQuery,
+            JSON.stringify(stripVolatileFields(freshDevice)),
+            JSON.stringify(freshDevice.sources),
+            freshDevice.fetchedAt,
+            freshDevice.fetchedAt,
+          )
+      : null,
   };
 }
 
@@ -572,6 +574,7 @@ async function buildFreshDevice(name, normalizedName, env, onProgress = async ()
     stage: 'searching',
     stageLabel: `Buscando fuentes de especificaciones para ${name}...`,
   });
+  const preferredSource = await findPreferredSpecSource(name);
   const searchResults = await searchAcrossQueries(
     [
       searchQuery,
@@ -581,12 +584,15 @@ async function buildFreshDevice(name, normalizedName, env, onProgress = async ()
     ],
     maxSources + 4,
   );
+  const mergedCandidates = preferredSource
+    ? [preferredSource, ...searchResults.filter((entry) => entry.url !== preferredSource.url)]
+    : searchResults;
   await onProgress({
     fraction: 0.35,
     stage: 'selecting-sources',
     stageLabel: `Seleccionando las fuentes mas fiables para ${name}...`,
   });
-  const selectedSources = selectSources(searchResults, maxSources);
+  const selectedSources = selectSources(mergedCandidates, maxSources);
   await onProgress({
     fraction: 0.62,
     stage: 'extracting',
@@ -677,10 +683,54 @@ async function searchAcrossQueries(queries, limit) {
     .slice(0, limit);
 }
 
+async function findPreferredSpecSource(deviceName) {
+  const gsmaSource = await findGsmaArenaSpecSource(deviceName);
+  if (gsmaSource) {
+    return gsmaSource;
+  }
+
+  return null;
+}
+
+async function findGsmaArenaSpecSource(deviceName) {
+  try {
+    const url = new URL('https://www.gsmarena.com/results.php3');
+    url.searchParams.set('sQuickSearch', 'yes');
+    url.searchParams.set('sName', deviceName);
+
+    const html = await fetchText(url.toString());
+    const match = html.match(
+      /<div class="makers">[\s\S]*?<li>\s*<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/li>/i,
+    );
+
+    if (!match) {
+      return null;
+    }
+
+    const relativeUrl = match[1];
+    const cardHtml = match[2];
+    const title = normalizeWhitespace(stripHtml(cardHtml)).replace(/\s+/g, ' ');
+
+    return {
+      title: title || `GSMArena - ${deviceName}`,
+      url: new URL(relativeUrl, 'https://www.gsmarena.com/').toString(),
+      snippet: 'Ficha tecnica exacta encontrada en GSMArena.',
+      hostScore: 150,
+      selected: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchSourceDocument(source) {
   try {
     const html = await fetchText(source.url);
-    const text = clipText(extractTextFromHtml(html), MAX_SOURCE_EXCERPT);
+    const structuredSpecs = isGsmaArenaSpecPage(source.url) ? parseGsmaArenaSpecs(html) : null;
+    const text = clipText(
+      structuredSpecs?.excerpt || extractTextFromHtml(html),
+      MAX_SOURCE_EXCERPT,
+    );
 
     if (!text) {
       return null;
@@ -691,6 +741,7 @@ async function fetchSourceDocument(source) {
       url: source.url,
       snippet: source.snippet,
       excerpt: text,
+      structuredSpecs,
       selected: true,
     };
   } catch {
@@ -831,6 +882,17 @@ async function compareDevices(devices, env) {
 }
 
 function buildHeuristicDevice(name, normalizedName, searchQuery, fetchedSources) {
+  const structuredSource = fetchedSources.find((source) => source?.structuredSpecs);
+  if (structuredSource?.structuredSpecs?.specs) {
+    return buildStructuredDevice(
+      name,
+      normalizedName,
+      searchQuery,
+      structuredSource.structuredSpecs,
+      fetchedSources,
+    );
+  }
+
   const combinedText = clipText(
     fetchedSources
       .map((source) => `${source.title}\n${source.snippet}\n${source.excerpt}`)
@@ -946,6 +1008,25 @@ function buildHeuristicDevice(name, normalizedName, searchQuery, fetchedSources)
     fetchedAt: new Date().toISOString(),
     confidence: computeDeviceConfidence(specs),
     summary: buildHeuristicSummary(name, specs),
+    specs,
+    sources: fetchedSources,
+  };
+}
+
+function buildStructuredDevice(name, normalizedName, searchQuery, structured, fetchedSources) {
+  const specs = structured.specs;
+
+  return {
+    id: normalizedName,
+    name,
+    normalizedName,
+    searchQuery,
+    fetchedAt: new Date().toISOString(),
+    confidence: computeDeviceConfidence(specs),
+    summary:
+      structured.summary ||
+      buildHeuristicSummary(name, specs) ||
+      `${name} se estructuro a partir de una ficha tecnica exacta.`,
     specs,
     sources: fetchedSources,
   };
@@ -1146,10 +1227,18 @@ function stripVolatileFields(device) {
 }
 
 function hasExpandedSpecs(specs) {
-  return CATEGORY_DEFINITIONS.every(([key]) => {
-    const value = specs?.[key]?.value;
-    return typeof value === 'string' && value.length > 0;
-  });
+  return countMeaningfulSpecs(specs) >= 6;
+}
+
+function shouldCacheDevice(device) {
+  return countMeaningfulSpecs(device?.specs) >= 6;
+}
+
+function countMeaningfulSpecs(specs) {
+  return CATEGORY_DEFINITIONS.filter(([key]) => {
+    const value = cleanTextValue(specs?.[key]?.value);
+    return value && value !== 'No concluyente';
+  }).length;
 }
 
 function buildComparisonKey(devices) {
@@ -1621,6 +1710,293 @@ function extractChargingMetrics(text) {
   };
 }
 
+function isGsmaArenaSpecPage(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return (
+      parsedUrl.hostname.includes('gsmarena.com') &&
+      /-\d+\.php$/i.test(parsedUrl.pathname) &&
+      !parsedUrl.pathname.includes('-review-') &&
+      !parsedUrl.pathname.includes('-news-') &&
+      !parsedUrl.pathname.includes('-price-')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parseGsmaArenaSpecs(html) {
+  const rows = extractGsmaArenaRows(html);
+  if (!rows.length) {
+    return null;
+  }
+
+  const networkValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Network', 'Technology'),
+      getGsmaArenaValue(rows, 'Network', '5G bands'),
+      getGsmaArenaValue(rows, 'Network', 'Speed'),
+    ],
+    ' | ',
+  );
+  const launchValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Launch', 'Announced'),
+      getGsmaArenaValue(rows, 'Launch', 'Status'),
+    ],
+    ' | ',
+  );
+  const bodyValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Body', 'Dimensions'),
+      getGsmaArenaValue(rows, 'Body', 'Weight'),
+      getGsmaArenaValue(rows, 'Body', 'Build'),
+      ...getGsmaArenaExtras(rows, 'Body'),
+    ],
+    ' | ',
+  );
+  const displayValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Display', 'Type'),
+      getGsmaArenaValue(rows, 'Display', 'Size'),
+      getGsmaArenaValue(rows, 'Display', 'Resolution'),
+      getGsmaArenaValue(rows, 'Display', 'Protection'),
+      ...getGsmaArenaExtras(rows, 'Display'),
+    ],
+    ' | ',
+  );
+  const socValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Platform', 'Chipset'),
+      getGsmaArenaValue(rows, 'Platform', 'CPU'),
+      getGsmaArenaValue(rows, 'Platform', 'GPU'),
+    ],
+    ' | ',
+  );
+  const osValue = getGsmaArenaValue(rows, 'Platform', 'OS');
+  const memoryValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Memory', 'Internal'),
+      getGsmaArenaValue(rows, 'Memory', 'Card slot'),
+      ...getGsmaArenaExtras(rows, 'Memory'),
+    ],
+    ' | ',
+  );
+  const mainCameraValue = joinUniqueParts(
+    [
+      getGsmaArenaFirstMatchingValue(rows, 'Main Camera', ['Quad', 'Triple', 'Dual', 'Single']),
+      getGsmaArenaValue(rows, 'Main Camera', 'Features'),
+      getGsmaArenaValue(rows, 'Main Camera', 'Video'),
+    ],
+    ' | ',
+  );
+  const selfieCameraValue = joinUniqueParts(
+    [
+      getGsmaArenaFirstMatchingValue(rows, 'Selfie camera', ['Single', 'Dual']),
+      getGsmaArenaValue(rows, 'Selfie camera', 'Features'),
+      getGsmaArenaValue(rows, 'Selfie camera', 'Video'),
+    ],
+    ' | ',
+  );
+  const soundValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Sound', 'Loudspeaker'),
+      getGsmaArenaValue(rows, 'Sound', '3.5mm jack'),
+    ],
+    ' | ',
+  );
+  const connectivityValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Comms', 'WLAN'),
+      getGsmaArenaValue(rows, 'Comms', 'Bluetooth'),
+      getGsmaArenaValue(rows, 'Comms', 'Positioning'),
+      getGsmaArenaValue(rows, 'Comms', 'NFC'),
+      getGsmaArenaValue(rows, 'Comms', 'Infrared port'),
+      getGsmaArenaValue(rows, 'Comms', 'USB'),
+    ],
+    ' | ',
+  );
+  const featuresValue = joinUniqueParts(
+    [
+      getGsmaArenaValue(rows, 'Features', 'Sensors'),
+      ...getGsmaArenaExtras(rows, 'Features'),
+    ],
+    ' | ',
+  );
+  const batteryValue = getGsmaArenaValue(rows, 'Battery', 'Type');
+  const chargingValue = getGsmaArenaValue(rows, 'Battery', 'Charging');
+  const priceValue = getGsmaArenaValue(rows, 'Misc', 'Price');
+
+  const displayInches = extractFloat(displayValue, /(\d(?:\.\d{1,2})?)\s?inches/i);
+  const refreshHz = extractNumber(displayValue, /(\d{2,3})\s?Hz/i);
+  const peakNits = extractNumber(displayValue, /(\d{3,4})\s?nits/i);
+  const batteryMah = extractNumber(batteryValue, /(\d[\d.,]{2,6})\s?(?:mAh|mah)/i);
+  const chargingMetrics = extractChargingMetrics(chargingValue);
+  const bodyDetails = {
+    value: bodyValue,
+    weightGrams: extractFloat(bodyValue, /(\d{2,3}(?:\.\d+)?)\s?g\b/i),
+    thicknessMm: extractThicknessMm(getGsmaArenaValue(rows, 'Body', 'Dimensions')),
+  };
+  const memoryDetails = buildMemoryValue(memoryValue);
+  const connectivityDetails = buildConnectivityValue(connectivityValue);
+  const price = extractPrice(priceValue);
+
+  const specs = {
+    network: {
+      value: networkValue || 'No concluyente',
+      score: computeNetworkScore(networkValue),
+    },
+    launch: {
+      value: launchValue || 'No concluyente',
+      score: computeLaunchScore(launchValue),
+    },
+    body: {
+      value: bodyValue || 'No concluyente',
+      score: computeBodyScore(bodyDetails),
+      weightGrams: bodyDetails.weightGrams,
+      thicknessMm: bodyDetails.thicknessMm,
+    },
+    display: {
+      value: displayValue || 'No concluyente',
+      score: computeDisplayScore(displayValue, displayInches, refreshHz, peakNits),
+      sizeInches: displayInches,
+      refreshHz,
+      peakNits,
+    },
+    soc: {
+      value: socValue || 'No concluyente',
+      score: computeSocScore(socValue),
+    },
+    memory: {
+      value: memoryValue || 'No concluyente',
+      score: computeMemoryScore(memoryDetails),
+      maxRamGb: memoryDetails.maxRamGb,
+      maxStorageGb: memoryDetails.maxStorageGb,
+    },
+    mainCamera: {
+      value: mainCameraValue || 'No concluyente',
+      score: computeCameraScore(mainCameraValue),
+    },
+    selfieCamera: {
+      value: selfieCameraValue || 'No concluyente',
+      score: computeSelfieCameraScore(selfieCameraValue),
+    },
+    sound: {
+      value: soundValue || 'No concluyente',
+      score: computeSoundScore(soundValue),
+    },
+    connectivity: {
+      value: connectivityValue || 'No concluyente',
+      score: computeConnectivityScore(connectivityDetails),
+      wifiVersion: connectivityDetails.wifiVersion,
+      bluetoothVersion: connectivityDetails.bluetoothVersion,
+    },
+    features: {
+      value: featuresValue || 'No concluyente',
+      score: computeFeaturesScore(featuresValue),
+    },
+    battery: {
+      value: batteryValue || 'No concluyente',
+      score: batteryMah ? Math.round(batteryMah / 100) : null,
+      capacityMah: batteryMah,
+    },
+    charging: {
+      value: chargingValue || 'No concluyente',
+      score: computeChargingScore(chargingMetrics),
+      watts: chargingMetrics.wiredWatts,
+      wirelessWatts: chargingMetrics.wirelessWatts,
+    },
+    os: {
+      value: osValue || 'No concluyente',
+      score: computeOsScore(osValue),
+    },
+    price: {
+      value: priceValue || 'No concluyente',
+      amount: price.amount,
+      currency: price.currency,
+    },
+  };
+
+  return {
+    specs,
+    excerpt: rows.map((row) => `${row.section} ${row.label}: ${row.value}`).join('\n'),
+    summary: '',
+  };
+}
+
+function extractGsmaArenaRows(html) {
+  const specsRoot = html.match(/<div id="specs-list">([\s\S]*?)<\/div>\s*<script/i)?.[1] ?? '';
+  if (!specsRoot) {
+    return [];
+  }
+
+  const rows = [];
+  let currentSection = '';
+
+  for (const tableMatch of specsRoot.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi)) {
+    const tableHtml = tableMatch[1];
+
+    for (const rowMatch of tableHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)) {
+      const rowHtml = rowMatch[1];
+      const sectionMatch = rowHtml.match(/<th[^>]*>([\s\S]*?)<\/th>/i);
+      if (sectionMatch) {
+        currentSection = normalizeWhitespace(stripHtml(sectionMatch[1]));
+      }
+
+      const cells = [...rowHtml.matchAll(/<td[^>]*class="([^"]*)"[^>]*>([\s\S]*?)<\/td>/gi)];
+      if (!cells.length || !currentSection) {
+        continue;
+      }
+
+      const labelCell = cells.find((cell) => cell[1].includes('ttl'));
+      const valueCell = cells.find((cell) => cell[1].includes('nfo'));
+      if (!valueCell) {
+        continue;
+      }
+
+      const label = normalizeWhitespace(stripHtml(labelCell?.[2] ?? '')) || '';
+      const value = normalizeWhitespace(stripHtml(valueCell[2]));
+      if (!value) {
+        continue;
+      }
+
+      rows.push({
+        section: currentSection,
+        label,
+        value,
+      });
+    }
+  }
+
+  return rows;
+}
+
+function getGsmaArenaValue(rows, section, label) {
+  return joinUniqueParts(
+    rows
+      .filter((row) => row.section === section && row.label === label)
+      .map((row) => row.value),
+    ' / ',
+  );
+}
+
+function getGsmaArenaExtras(rows, section) {
+  return rows
+    .filter((row) => row.section === section && !row.label)
+    .map((row) => row.value);
+}
+
+function getGsmaArenaFirstMatchingValue(rows, section, labels) {
+  for (const label of labels) {
+    const value = getGsmaArenaValue(rows, section, label);
+    if (value) {
+      return value;
+    }
+  }
+
+  return '';
+}
+
 function joinUniqueParts(parts, separator = ', ') {
   const seen = new Set();
   const values = [];
@@ -1666,10 +2042,18 @@ function extractThicknessMm(dimensions) {
     return null;
   }
 
-  const matches = [...dimensions.matchAll(/(\d{1,3}(?:\.\d+)?)\s*(?=mm|[xX])/gi)].map((match) =>
+  const metricPart = dimensions.split('(')[0];
+  const mmMatches = [...metricPart.matchAll(/(\d{1,3}(?:\.\d+)?)\s?mm/gi)].map((match) =>
     Number.parseFloat(match[1]),
   );
-  return matches.length ? matches[matches.length - 1] : null;
+  if (mmMatches.length) {
+    return mmMatches[mmMatches.length - 1];
+  }
+
+  const xMatches = [...metricPart.matchAll(/(\d{1,3}(?:\.\d+)?)\s*(?=[xX])/gi)].map((match) =>
+    Number.parseFloat(match[1]),
+  );
+  return xMatches.length ? xMatches[xMatches.length - 1] : null;
 }
 
 function normalizeStorageToGb(rawAmount, unit) {
@@ -1835,18 +2219,14 @@ function getSourceHostScore(candidateUrl) {
 
 function extractTextFromHtml(html) {
   return normalizeWhitespace(
-    html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-      .replace(/<!--[\s\S]*?-->/g, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-      .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(Number.parseInt(code, 16)))
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'"),
+    decodeHtmlEntities(
+      html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<[^>]+>/g, ' '),
+    ),
   );
 }
 
@@ -1997,7 +2377,21 @@ function normalizeWhitespace(value) {
 }
 
 function stripHtml(value) {
-  return normalizeWhitespace(String(value ?? '').replace(/<[^>]+>/g, ' '));
+  return normalizeWhitespace(decodeHtmlEntities(String(value ?? '').replace(/<[^>]+>/g, ' ')));
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? '')
+    .replace(/&nbsp;|&thinsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;|&#39;/g, "'")
+    .replace(/&deg;/g, 'deg')
+    .replace(/&Prime;/g, '"')
+    .replace(/&prime;/g, "'")
+    .replace(/&euro;/gi, 'EUR ')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(Number.parseInt(code, 16)));
 }
 
 function toInteger(value, fallback) {
