@@ -1,0 +1,48 @@
+{
+  "name": "phonecomparer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Dynamic phone comparison app on Cloudflare Workers + D1 + Assets.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "cf:types": "wrangler types",
+    "cf:db:local": "node ./scripts/run-d1-local.mjs",
+    "cf:dev": "wrangler dev --local --ip localhost --port 8788",
+    "dev:full": "node ./scripts/dev-local.mjs",
+    "watch:build": "node ./scripts/watch-build.mjs",
+    "dev:live": "concurrently -k -n build,worker \"npm:watch:build\" \"npm:cf:dev\"",
+    "check": "npm run lint && npm run build",
+    "deploy": "vite build && wrangler deploy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fcosegura/phoneComparer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fcosegura/phoneComparer/issues"
+  },
+  "homepage": "https://github.com/fcosegura/phoneComparer#readme",
+  "dependencies": {
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.6.0",
+    "vite": "^8.0.12",
+    "wrangler": "^4.90.1"
+  }
+}

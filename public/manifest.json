@@ -1,0 +1,17 @@
+{
+  "name": "phoneComparer",
+  "short_name": "phoneComparer",
+  "description": "Comparador dinamico de smartphones con Cloudflare Workers, D1 y Workers AI.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1120",
+  "theme_color": "#111827",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
