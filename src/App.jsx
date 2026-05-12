@@ -1,14 +1,22 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-const CATEGORY_LABELS = {
-  soc: 'SOC',
-  cameras: 'Camaras',
-  battery: 'Bateria',
-  charging: 'Carga',
-  display: 'Pantalla',
-  os: 'OS',
-  price: 'Precio',
-};
+const CATEGORY_DEFINITIONS = [
+  ['network', 'Red'],
+  ['launch', 'Lanzamiento'],
+  ['body', 'Cuerpo'],
+  ['display', 'Pantalla'],
+  ['soc', 'Plataforma'],
+  ['memory', 'Memoria'],
+  ['mainCamera', 'Camara principal'],
+  ['selfieCamera', 'Camara selfie'],
+  ['sound', 'Audio'],
+  ['connectivity', 'Conectividad'],
+  ['features', 'Sensores'],
+  ['battery', 'Bateria'],
+  ['charging', 'Carga'],
+  ['os', 'OS'],
+  ['price', 'Precio'],
+];
 
 const EMPTY_FORM = ['', ''];
 
@@ -20,6 +28,7 @@ function App() {
   const [deviceNames, setDeviceNames] = useState(EMPTY_FORM);
   const [forceRefresh, setForceRefresh] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [job, setJob] = useState(null);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
 
@@ -45,13 +54,82 @@ function App() {
     });
   }
 
+  useEffect(() => {
+    if (!job?.id || job.status === 'completed' || job.status === 'failed') {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timeoutId;
+
+    async function pollJob() {
+      try {
+        const response = await fetch(`/api/compare/status?id=${encodeURIComponent(job.id)}`, {
+          credentials: 'same-origin',
+        });
+        const payload = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          throw new Error(payload.error ?? 'No se pudo consultar el progreso de la comparacion.');
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        setJob(payload.job);
+
+        if (payload.job?.status === 'completed') {
+          setResult(payload.result ?? null);
+          setLoading(false);
+          return;
+        }
+
+        if (payload.job?.status === 'failed') {
+          setError(payload.job?.errorMessage ?? 'La comparacion termino con error.');
+          setLoading(false);
+          return;
+        }
+
+        timeoutId = window.setTimeout(pollJob, 1200);
+      } catch (pollError) {
+        if (cancelled) {
+          return;
+        }
+
+        setError(pollError.message);
+        setLoading(false);
+        setJob((current) =>
+          current
+            ? {
+                ...current,
+                status: 'failed',
+                errorMessage: pollError.message,
+              }
+            : current,
+        );
+      }
+    }
+
+    timeoutId = window.setTimeout(pollJob, job.status === 'queued' ? 500 : 1000);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [job?.id, job?.status]);
+
   async function handleSubmit(event) {
     event.preventDefault();
     setError('');
     setLoading(true);
+    setJob(null);
+    setResult(null);
 
     try {
-      const response = await fetch('/api/compare', {
+      const response = await fetch('/api/compare/start', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {
@@ -69,16 +147,18 @@ function App() {
         throw new Error(payload.error ?? 'No se pudo completar la comparacion.');
       }
 
-      setResult(payload);
+      setJob(payload.job ?? null);
     } catch (submitError) {
       setError(submitError.message);
-    } finally {
+      setJob(null);
+      setResult(null);
       setLoading(false);
     }
   }
 
   const comparisonRows = result?.comparison?.categories ?? [];
   const overallWinnerNames = result?.comparison?.overallWinnerIds ?? [];
+  const progressValue = Math.max(4, Math.min(100, Math.round(job?.progress ?? 4)));
 
   return (
     <div className="app-shell">
@@ -168,7 +248,7 @@ function App() {
                   className="primary-button"
                   disabled={loading || normalizedInputs.length < 2 || normalizedInputs.length > 5}
                 >
-                  {loading ? 'Comparando...' : 'Comparar'}
+                  {loading ? 'Buscando...' : 'Comparar'}
                 </button>
               </div>
               <p className="hint">
@@ -180,6 +260,33 @@ function App() {
 
           {error ? <div className="notice error">{error}</div> : null}
         </section>
+
+        {loading ? (
+          <section className="card progress-card">
+            <div className="section-heading">
+              <div>
+                <span className="eyebrow">Progreso</span>
+                <h2>Buscando especificaciones</h2>
+                <p>
+                  {job?.stageLabel ??
+                    'Preparando la comparacion, consultando fuentes y estructurando la ficha tecnica.'}
+                </p>
+              </div>
+              <div className="progress-percent">{progressValue}%</div>
+            </div>
+
+            <div className="progress-track" aria-hidden="true">
+              <span className="progress-fill" style={{ width: `${progressValue}%` }} />
+            </div>
+
+            <div className="progress-meta">
+              <strong>
+                {job?.completedCount ?? 0}/{job?.deviceCount ?? normalizedInputs.length}
+              </strong>
+              <span>dispositivos resueltos</span>
+            </div>
+          </section>
+        ) : null}
 
         {result ? (
           <>
@@ -248,7 +355,7 @@ function App() {
                   </div>
 
                   <dl className="spec-list">
-                    {Object.entries(CATEGORY_LABELS).map(([key, label]) => (
+                    {CATEGORY_DEFINITIONS.map(([key, label]) => (
                       <div key={key} className="spec-item">
                         <dt>{label}</dt>
                         <dd>{device.specs?.[key]?.value || 'Sin dato'}</dd>
@@ -294,7 +401,11 @@ function App() {
                     {comparisonRows.map((row) => (
                       <tr key={row.key}>
                         <td>
-                          <strong>{row.label || CATEGORY_LABELS[row.key] || row.key}</strong>
+                          <strong>
+                            {row.label ||
+                              CATEGORY_DEFINITIONS.find(([key]) => key === row.key)?.[1] ||
+                              row.key}
+                          </strong>
                           <p>{row.reasoning || 'Sin observaciones.'}</p>
                         </td>
                         {result.devices.map((device) => {
